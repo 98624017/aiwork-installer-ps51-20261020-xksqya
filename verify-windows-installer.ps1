@@ -73,6 +73,7 @@ function Get-Payload([object]$Item) {
     Assert-True ($null -ne $Item) 'manifest-payload-missing'
     Assert-True ([IO.Path]::GetFileName([string]$Item.file) -eq [string]$Item.file) 'manifest-file-must-be-basename'
     Assert-True ([string]$Item.sha256 -match '^[a-fA-F0-9]{64}$') 'manifest-invalid-hash'
+    Assert-True ([string]$Item.version -match '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$') 'manifest-invalid-version'
     $path = Join-Path $PayloadDirectory ([string]$Item.file)
     $hash = Get-Hash $path
     Assert-True ($hash -eq ([string]$Item.sha256).ToLowerInvariant()) 'payload-hash-mismatch'
@@ -129,6 +130,7 @@ function Invoke-Case([string]$Name, [scriptblock]$Body) {
         $case.exceptionType = $_.Exception.GetType().FullName
         $case.errorCategory = [string]$_.CategoryInfo.Category
         if (Get-Variable LastInstallerTrace -Scope Script -ErrorAction SilentlyContinue) { $case.installerTrace = $script:LastInstallerTrace }
+        if (Get-Variable LastInstalledVersionEvidence -Scope Script -ErrorAction SilentlyContinue) { $case.installedVersion = $script:LastInstalledVersionEvidence }
         Write-Host ('FAIL ' + $Name + ' [' + $case.failureCode + ']')
     }
     finally {
@@ -393,13 +395,19 @@ function Assert-InstalledIdentity([object]$Package = $Candidate) {
     if ($null -ne $manifest.PSObject.Properties['expectedChannelName']) {
         Assert-True ([string]$binding.channelName -ceq [string]$manifest.expectedChannelName) 'channel-name-not-expected'
     }
-    $version = (Get-Item -LiteralPath $TargetExecutable).VersionInfo.ProductVersion
-    Assert-True ($version -eq $Package.version) 'installed-version-mismatch'
+    $versionInfo = (Get-Item -LiteralPath $TargetExecutable).VersionInfo
+    $version = [string]$versionInfo.FileVersion
+    $nativeVersion = '{0}.{1}.{2}.{3}' -f $versionInfo.ProductMajorPart, $versionInfo.ProductMinorPart, $versionInfo.ProductBuildPart, $versionInfo.ProductPrivatePart
+    $expectedNativeVersion = (($Package.version -split '[-+]', 2)[0]) + '.0'
+    $script:LastInstalledVersionEvidence = [ordered]@{ setupSha256 = $Package.sha256; expectedVersion = $Package.version; observedProductVersion = [string]$versionInfo.ProductVersion; observedFileVersion = $version; observedNativeProductVersion = $nativeVersion; expectedNativeProductVersion = $expectedNativeVersion }
     $hashes = Get-InstalledHashes
     foreach ($pair in @(@{ manifest = 'exeSha256'; installed = 'exe' }, @{ manifest = 'asarSha256'; installed = 'asar' }, @{ manifest = 'helperSha256'; installed = 'helper' })) {
         $pin = [string]$Package.($pair.manifest)
         if ($pin -ne '') { Assert-True ($hashes[$pair.installed] -eq $pin) 'installed-package-hash-pin-mismatch' }
     }
+    # Windows ProductVersion is numeric; electron-builder stores the full semver in FileVersion.
+    Assert-True ($version -eq $Package.version) 'installed-file-version-mismatch'
+    Assert-True ($nativeVersion -eq $expectedNativeVersion) 'installed-native-product-version-mismatch'
     $code = (Get-Content -LiteralPath (Join-Path $InstallDirectory 'channel-code.txt') -Raw -Encoding UTF8).Trim()
     Assert-True ($code -eq 'XINBAO-AI') 'channel-code-mismatch'
     $diagnostics = Get-Content -LiteralPath (Join-Path $InstallDirectory 'channel-install-diagnostics.json') -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -440,7 +448,7 @@ function Assert-InstalledIdentity([object]$Package = $Candidate) {
     }
     Assert-True ((Get-Content -LiteralPath (Join-Path $AssetDirectory 'sentinel.txt') -Raw -Encoding UTF8) -eq 'external-asset-must-survive') 'external-assets-changed'
     $slug = if ($null -ne $binding.PSObject.Properties['channelSlug']) { [string]$binding.channelSlug } elseif ($null -ne $binding.PSObject.Properties['slug']) { [string]$binding.slug } else { '' }
-    return [ordered]@{ version = $version; channelName = [string]$binding.channelName; channelSlug = $slug; mode = $mode; bindingPresent = $true; appUserModelId = $appId; shortcuts = $links; hashes = $hashes }
+    return [ordered]@{ version = $version; productVersion = [string]$versionInfo.ProductVersion; nativeProductVersion = $nativeVersion; channelName = [string]$binding.channelName; channelSlug = $slug; mode = $mode; bindingPresent = $true; appUserModelId = $appId; shortcuts = $links; hashes = $hashes }
 }
 
 function Assert-CandidateFiles {
@@ -821,6 +829,7 @@ finally {
     $Report.status = if ($null -eq $Failure -and $Report.failedCaseCount -eq 0 -and $Cases.Count -eq $ExpectedCaseCount) { 'passed' } else { 'failed' }
     if (Get-Variable LastUiEvidence -Scope Script -ErrorAction SilentlyContinue) { $Report.lastUi = $script:LastUiEvidence }
     if (Get-Variable LastInstallerTrace -Scope Script -ErrorAction SilentlyContinue) { $Report.lastInstallerTrace = $script:LastInstallerTrace }
+    if (Get-Variable LastInstalledVersionEvidence -Scope Script -ErrorAction SilentlyContinue) { $Report.lastInstalledVersion = $script:LastInstalledVersionEvidence }
     [IO.Directory]::CreateDirectory($OutputDirectory) | Out-Null
     Write-Json (Join-Path $OutputDirectory 'report.json') $Report
     $lines = @('Status: ' + $Report.status)

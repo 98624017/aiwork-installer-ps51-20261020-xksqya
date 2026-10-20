@@ -1,3 +1,6 @@
 payload/
 evidence/
 *.exe
+*.log
+architecture-*/
+release-notes.md

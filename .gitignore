@@ -3,4 +3,5 @@ evidence/
 *.exe
 *.log
 architecture-*/
+native-run-*/
 release-notes.md

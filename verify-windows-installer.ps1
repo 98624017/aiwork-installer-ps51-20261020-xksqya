@@ -128,6 +128,7 @@ function Invoke-Case([string]$Name, [scriptblock]$Body) {
         $case.failureLine = $_.InvocationInfo.ScriptLineNumber
         $case.exceptionType = $_.Exception.GetType().FullName
         $case.errorCategory = [string]$_.CategoryInfo.Category
+        if (Get-Variable LastInstallerTrace -Scope Script -ErrorAction SilentlyContinue) { $case.installerTrace = $script:LastInstallerTrace }
         Write-Host ('FAIL ' + $Name + ' [' + $case.failureCode + ']')
     }
     finally {
@@ -218,6 +219,23 @@ function Test-VisibleLossWarning([object[]]$Windows) {
     return $false
 }
 
+function Get-InstallerPageStage([object[]]$Windows) {
+    if (@($Windows | Where-Object { $_.Id -eq 6 -and (Get-UiLabel $_.Text) -eq 'force' }).Count -gt 0) { return 'force-warning' }
+    if (@($Windows | Where-Object { $_.Id -eq 4 -and (Get-UiLabel $_.Text) -eq 'normal' }).Count -gt 0) { return 'normal-close-prompt' }
+    if (@($Windows | Where-Object { $_.Id -eq 1201 -and $_.ClassName -eq 'Edit' }).Count -gt 0 -and
+        @($Windows | Where-Object { $_.Id -eq 1200 -and $_.ClassName -eq 'Static' }).Count -gt 0 -and
+        @($Windows | Where-Object { $_.Id -eq 1202 -and $_.ClassName -eq 'Static' }).Count -gt 0) { return 'channel-input' }
+    if (@($Windows | Where-Object { $_.ClassName -eq 'msctls_progress32' }).Count -gt 0) { return 'install-progress' }
+    if (@($Windows | Where-Object { $_.Id -eq 1 -and (Get-UiLabel $_.Text) -eq 'wizard-next' }).Count -gt 0) { return 'wizard-navigation' }
+    return 'waiting'
+}
+
+function Add-InstallerTrace([Collections.ArrayList]$Trace, [Diagnostics.Stopwatch]$Timer, [string]$Stage, [string]$Action, [string]$Transport, [int]$ControlId, [bool]$Succeeded) {
+    $Trace.Add([ordered]@{ elapsedSeconds = [Math]::Round($Timer.Elapsed.TotalSeconds, 2); stage = $Stage; action = $Action; transport = $Transport; controlId = $ControlId; succeeded = $Succeeded }) | Out-Null
+    if ($Trace.Count -gt 160) { $Trace.RemoveAt(0) }
+    $script:LastInstallerTrace = @($Trace)
+}
+
 function Invoke-Installer([object]$Package, [string]$Mode, [string]$Scenario) {
     Assert-True (([DateTime]::UtcNow - $StartedAt).TotalMinutes -lt 25) 'overall-harness-time-budget-exhausted'
     $arguments = '/currentuser '
@@ -229,7 +247,11 @@ function Invoke-Installer([object]$Package, [string]$Mode, [string]$Scenario) {
     $ids.Add($process.Id) | Out-Null
     $OwnedInstallerIds.Add($process.Id) | Out-Null
     $actions = New-Object System.Collections.ArrayList
+    $trace = New-Object System.Collections.ArrayList
+    $script:LastInstallerTrace = @()
     $timer = [Diagnostics.Stopwatch]::StartNew()
+    $lastStage = ''
+    $channelInputHandle = [IntPtr]::Zero
     $emptySince = $null
     $lastUi = @()
     $lastHandle = [IntPtr]::Zero
@@ -245,6 +267,21 @@ function Invoke-Installer([object]$Package, [string]$Mode, [string]$Scenario) {
         Read-PackagedHelperEvidence $live $Package
         $lastUi = @([NativeInstallerProbe]::Windows([int[]]@($live | ForEach-Object { [int]$_.ProcessId })))
         if ($lastUi.Count -gt 0) { $script:LastUiEvidence = Get-UiEvidence $lastUi }
+        $stage = Get-InstallerPageStage $lastUi
+        if ($stage -ne $lastStage) {
+            Add-InstallerTrace $trace $timer $stage 'page-observed' 'enumeration' 0 $true
+            $lastStage = $stage
+        }
+        if ($stage -eq 'channel-input') {
+            $field = @($lastUi | Where-Object { $_.Id -eq 1201 -and $_.ClassName -eq 'Edit' })[0]
+            if ($field.Handle -ne $channelInputHandle) {
+                $set = [NativeInstallerProbe]::SetText($field.Handle, 'XINBAO-AI')
+                $confirmed = $set -and [NativeInstallerProbe]::TextEquals($field.Handle, 'XINBAO-AI')
+                Add-InstallerTrace $trace $timer $stage 'authorized-channel-input-confirmed' 'WM_SETTEXT' $field.Id $confirmed
+                Assert-True $confirmed 'activation-page-channel-input-failed'
+                $channelInputHandle = $field.Handle
+            }
+        }
         if ($null -ne $FixtureProcess -and -not $FixtureProcess.HasExited -and $null -ne $ExpectedInstalled -and (Test-Path -LiteralPath $TargetExecutable)) {
             if ((Get-Hash $TargetExecutable) -eq $ExpectedInstalled.exe) { $replacementWhileFixtureAlive = $true }
         }
@@ -294,7 +331,10 @@ function Invoke-Installer([object]$Package, [string]$Mode, [string]$Scenario) {
             if ($action -eq 'cancel-after-warning') { $warningCount++ }
             if ($action -eq 'normal-close') { $normalCount++ }
             if ($action -eq 'cancel-or-abort-locked-replacement') { $lockCancelCount++ }
-            Assert-True ([NativeInstallerProbe]::Click($chosen.Handle)) 'button-post-failed'
+            $transport = if ($action -eq 'wizard-next') { 'WM_COMMAND-BN_CLICKED' } else { 'BM_CLICK' }
+            $posted = if ($action -eq 'wizard-next') { [NativeInstallerProbe]::Command($chosen.Handle) } else { [NativeInstallerProbe]::Click($chosen.Handle) }
+            Add-InstallerTrace $trace $timer $stage $action $transport $chosen.Id $posted
+            Assert-True $posted 'button-post-failed'
             $actions.Add($action) | Out-Null
             $lastHandle = $chosen.Handle
             $lastClickAt = [DateTime]::UtcNow
@@ -524,12 +564,15 @@ public static class NativeInstallerProbe {
     [DllImport("user32.dll")] private static extern bool IsWindowEnabled(IntPtr h);
     [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr h, out uint id);
     [DllImport("user32.dll")] private static extern int GetDlgCtrlID(IntPtr h);
+    [DllImport("user32.dll")] private static extern IntPtr GetParent(IntPtr h);
     [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr h, out WindowRect rect);
     [DllImport("user32.dll", EntryPoint="GetWindowLongPtrW")] private static extern IntPtr GetWindowLongPtr(IntPtr h, int index);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetClassName(IntPtr h, StringBuilder b, int n);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetWindowText(IntPtr h, StringBuilder b, int n);
     [DllImport("user32.dll")] private static extern bool PostMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
     [DllImport("user32.dll")] private static extern IntPtr SendMessageTimeout(IntPtr h, uint msg, IntPtr w, IntPtr l, uint flags, uint timeout, out IntPtr result);
+    [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", CharSet=CharSet.Unicode)] private static extern IntPtr SendTextTimeout(IntPtr h, uint msg, IntPtr w, string text, uint flags, uint timeout, out IntPtr result);
+    [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", CharSet=CharSet.Unicode)] private static extern IntPtr ReadTextTimeout(IntPtr h, uint msg, IntPtr w, StringBuilder text, uint flags, uint timeout, out IntPtr result);
     [DllImport("kernel32.dll")] private static extern IntPtr OpenProcess(uint rights, bool inherit, int pid);
     [DllImport("kernel32.dll")] private static extern bool CloseHandle(IntPtr h);
     [DllImport("ntdll.dll")] private static extern int NtSuspendProcess(IntPtr h);
@@ -554,6 +597,9 @@ public static class NativeInstallerProbe {
         return items.ToArray();
     }
     public static bool Click(IntPtr h) { return PostMessage(h, 0xF5, IntPtr.Zero, IntPtr.Zero); }
+    public static bool Command(IntPtr h) { IntPtr parent=GetParent(h); return parent!=IntPtr.Zero && PostMessage(parent,0x111,new IntPtr(GetDlgCtrlID(h) & 0xffff),h); }
+    public static bool SetText(IntPtr h, string text) { IntPtr result; return SendTextTimeout(h,0xC,IntPtr.Zero,text,2,1000,out result)!=IntPtr.Zero && result!=IntPtr.Zero; }
+    public static bool TextEquals(IntPtr h, string expected) { IntPtr result; StringBuilder text=new StringBuilder(64); return ReadTextTimeout(h,0xD,new IntPtr(text.Capacity),text,2,1000,out result)!=IntPtr.Zero && text.ToString()==expected; }
     public static bool Checked(IntPtr h) { IntPtr result; SendMessageTimeout(h, 0xF0, IntPtr.Zero, IntPtr.Zero, 2, 1000, out result); return result.ToInt64()==1; }
     public static int Suspend(int pid) { IntPtr h=OpenProcess(0x800,false,pid); if(h==IntPtr.Zero)return -1; try{return NtSuspendProcess(h);}finally{CloseHandle(h);} }
     public static int Resume(int pid) { IntPtr h=OpenProcess(0x800,false,pid); if(h==IntPtr.Zero)return -1; try{return NtResumeProcess(h);}finally{CloseHandle(h);} }
@@ -576,6 +622,7 @@ public static class ValidationFixture {
             if(hang || delayed) { e.Cancel=true; if(delayed && !exitTimer.Enabled)exitTimer.Start(); }
         };
         Button button=new Button(); button.Text="Harness proceed"; button.Width=180; button.Top=30; button.Left=50;
+        TextBox input=new TextBox(); input.Width=180; input.Top=70; input.Left=50; form.Controls.Add(input);
         button.Click += delegate { hang=false; delayed=false; form.Close(); }; form.Controls.Add(button); Application.Run(form);
     }
 }
@@ -604,17 +651,26 @@ public static class ValidationFixture {
         okPattern = [regex]::Unescape('^(OK|\u786e\u5b9a)')
     }
     $ok = Invoke-Case 'native-ui-driver-self-test' {
-        $self = Start-Process -FilePath $FixtureExecutable -ArgumentList normal -PassThru
-        try {
-            $windows = @(Wait-VisibleWindow $self.Id 20)
-            Assert-True (@($windows | Where-Object { $_.Text -eq 'AIwork native validation fixture x64' }).Count -eq 1) 'fixture-not-running-as-x64'
-            $button = @($windows | Where-Object { $_.Text -eq 'Harness proceed' })
-            Assert-True ($button.Count -eq 1) 'ui-selftest-button-not-found'
-            Assert-True ([NativeInstallerProbe]::Click($button[0].Handle)) 'ui-selftest-click-failed'
-            Assert-True ($self.WaitForExit(10000)) 'ui-selftest-click-did-not-close'
-            return @{ visibleWindow = $true; nativeButtonClick = $true }
+        $observations = @{ visibleWindow = $true }
+        foreach ($transport in @('BM_CLICK', 'WM_COMMAND-BN_CLICKED')) {
+            $self = Start-Process -FilePath $FixtureExecutable -ArgumentList normal -PassThru
+            try {
+                $windows = @(Wait-VisibleWindow $self.Id 20)
+                Assert-True (@($windows | Where-Object { $_.Text -eq 'AIwork native validation fixture x64' }).Count -eq 1) 'fixture-not-running-as-x64'
+                $button = @($windows | Where-Object { $_.Text -eq 'Harness proceed' })
+                Assert-True ($button.Count -eq 1) 'ui-selftest-button-not-found'
+                $input = @($windows | Where-Object { $_.ClassName.StartsWith('WindowsForms10.EDIT', [StringComparison]::OrdinalIgnoreCase) })
+                Assert-True ($input.Count -eq 1) 'ui-selftest-input-not-found'
+                Assert-True ([NativeInstallerProbe]::SetText($input[0].Handle, 'XINBAO-AI') -and [NativeInstallerProbe]::TextEquals($input[0].Handle, 'XINBAO-AI')) 'ui-selftest-input-not-confirmed'
+                $posted = if ($transport -eq 'BM_CLICK') { [NativeInstallerProbe]::Click($button[0].Handle) } else { [NativeInstallerProbe]::Command($button[0].Handle) }
+                Assert-True $posted 'ui-selftest-click-failed'
+                Assert-True ($self.WaitForExit(10000)) 'ui-selftest-click-did-not-close'
+                $observations[$transport] = $true
+                $observations.WM_SETTEXT = $true
+            }
+            finally { if (-not $self.HasExited) { Stop-Process -Id $self.Id -Force } }
         }
-        finally { if (-not $self.HasExited) { Stop-Process -Id $self.Id -Force } }
+        return $observations
     }
     Assert-True $ok 'native-ui-prerequisite-failed'
     $ok = Invoke-Case 'protected-baseline-fresh-interactive-real-channel' {
@@ -764,6 +820,7 @@ finally {
     $Report.failedCaseCount = @($Cases | Where-Object { $_.status -eq 'failed' }).Count
     $Report.status = if ($null -eq $Failure -and $Report.failedCaseCount -eq 0 -and $Cases.Count -eq $ExpectedCaseCount) { 'passed' } else { 'failed' }
     if (Get-Variable LastUiEvidence -Scope Script -ErrorAction SilentlyContinue) { $Report.lastUi = $script:LastUiEvidence }
+    if (Get-Variable LastInstallerTrace -Scope Script -ErrorAction SilentlyContinue) { $Report.lastInstallerTrace = $script:LastInstallerTrace }
     [IO.Directory]::CreateDirectory($OutputDirectory) | Out-Null
     Write-Json (Join-Path $OutputDirectory 'report.json') $Report
     $lines = @('Status: ' + $Report.status)

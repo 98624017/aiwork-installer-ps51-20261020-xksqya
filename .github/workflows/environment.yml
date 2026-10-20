@@ -1,0 +1,26 @@
+name: Windows architecture probe
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - shell: powershell
+        run: .\probe.ps1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: architecture-${{ matrix.os }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 7

@@ -1,0 +1,42 @@
+name: Windows installer native validation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Download authorized candidates
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($PSVersionTable.PSEdition -ne 'Desktop' -or $PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) { throw 'Windows PowerShell 5.1 required' }
+          gh release download candidate --repo $env:GITHUB_REPOSITORY --pattern '*.exe' --dir payload
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate download failed' }
+      - name: Run native installer matrix
+        run: |
+          & .\verify-windows-installer.ps1 -ManifestPath .\candidate.json -PayloadDirectory .\payload -OutputDirectory .\evidence
+      - name: Upload sanitized evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-installer-${{ matrix.os }}-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 7

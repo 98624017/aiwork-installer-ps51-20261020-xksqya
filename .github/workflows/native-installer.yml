@@ -27,8 +27,11 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           if ($PSVersionTable.PSEdition -ne 'Desktop' -or $PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) { throw 'Windows PowerShell 5.1 required' }
-          gh release download candidate --repo $env:GITHUB_REPOSITORY --pattern '*.exe' --dir payload
-          if ($LASTEXITCODE -ne 0) { throw 'Candidate download failed' }
+          $manifest = Get-Content -LiteralPath .\candidate.json -Raw -Encoding UTF8 | ConvertFrom-Json
+          foreach ($file in @($manifest.baseline.file, $manifest.candidate.file)) {
+            gh release download candidate --repo $env:GITHUB_REPOSITORY --pattern $file --dir payload
+            if ($LASTEXITCODE -ne 0) { throw 'Candidate download failed' }
+          }
       - name: Run native installer matrix
         run: |
           & .\verify-windows-installer.ps1 -ManifestPath .\candidate.json -PayloadDirectory .\payload -OutputDirectory .\evidence

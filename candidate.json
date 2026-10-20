@@ -1,5 +1,6 @@
 {
   "channelCode": "XINBAO-AI",
+  "appGuid": "3b731237-98e1-50c0-957c-cc53cb848251",
   "expectedChannelName": "心宝Ai画板",
   "candidate": {
     "file": "candidate-setup.exe",

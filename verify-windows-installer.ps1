@@ -131,6 +131,8 @@ function Invoke-Case([string]$Name, [scriptblock]$Body) {
         $case.errorCategory = [string]$_.CategoryInfo.Category
         if (Get-Variable LastInstallerTrace -Scope Script -ErrorAction SilentlyContinue) { $case.installerTrace = $script:LastInstallerTrace }
         if (Get-Variable LastInstalledVersionEvidence -Scope Script -ErrorAction SilentlyContinue) { $case.installedVersion = $script:LastInstalledVersionEvidence }
+        if (Get-Variable LastShortcutEvidence -Scope Script -ErrorAction SilentlyContinue) { $case.shortcutEvidence = $script:LastShortcutEvidence }
+        if (Get-Variable LastLockCaseEvidence -Scope Script -ErrorAction SilentlyContinue) { $case.lockEvidence = $script:LastLockCaseEvidence }
         Write-Host ('FAIL ' + $Name + ' [' + $case.failureCode + ']')
     }
     finally {
@@ -388,7 +390,53 @@ function Invoke-Installer([object]$Package, [string]$Mode, [string]$Scenario) {
     return $result
 }
 
-function Assert-InstalledIdentity([object]$Package = $Candidate) {
+function Get-InstalledShortcutSnapshot([object[]]$Folders, [string]$Name, [string]$AppId, [object]$Package) {
+    $defaultName = [regex]::Unescape('AI \u521b\u4f5c\u5de5\u4f5c\u53f0.lnk')
+    $wscript = New-Object -ComObject WScript.Shell
+    $shell = New-Object -ComObject Shell.Application
+    $snapshot = [ordered]@{ setupSha256 = $Package.sha256; expectedFilename = $Name + '.lnk'; expectedAppUserModelId = $AppId; shortcutNameUtf16ByteLength = (Get-Item -LiteralPath (Join-Path $InstallDirectory 'channel-shortcut-name.txt')).Length; folders = @(); links = @(); unreadableLinkCount = 0 }
+    $script:LastShortcutEvidence = $snapshot
+    foreach ($folder in $Folders) {
+        $exists = -not [string]::IsNullOrWhiteSpace($folder.path) -and (Test-Path -LiteralPath $folder.path -PathType Container)
+        $entries = @()
+        if ($exists) { $entries = @(Get-ChildItem -LiteralPath $folder.path -Filter '*.lnk' -File -Recurse) }
+        $snapshot.folders += [ordered]@{ context = $folder.kind; exists = $exists; enumeratedLinkCount = $entries.Count }
+        foreach ($entry in $entries) {
+            $knownName = $entry.Name -eq ($Name + '.lnk') -or $entry.Name -eq $defaultName
+            try { $link = $wscript.CreateShortcut($entry.FullName); $target = [string]$link.TargetPath }
+            catch {
+                $snapshot.unreadableLinkCount++
+                if ($knownName) { $snapshot.links += [ordered]@{ context = $folder.kind; filename = $entry.Name; readable = $false; readErrorType = $_.Exception.GetType().Name } }
+                continue
+            }
+            $targetMatch = [string]::Equals($target, $TargetExecutable, [StringComparison]::OrdinalIgnoreCase)
+            $canonicalMatch = $targetMatch
+            if (-not $targetMatch -and $target -match '^[A-Za-z]:\\' -and $target.EndsWith('.exe', [StringComparison]::OrdinalIgnoreCase)) {
+                $canonicalMatch = [string]::Equals([NativeInstallerProbe]::LongPath($target), $TargetExecutable, [StringComparison]::OrdinalIgnoreCase)
+            }
+            if (-not ($knownName -or $targetMatch -or $canonicalMatch)) { continue }
+            $icon = ([string]$link.IconLocation -replace ',\s*-?\d+$', '').Trim('"')
+            $iconWithin = $icon.StartsWith($InstallDirectory + '\', [StringComparison]::OrdinalIgnoreCase)
+            $namespace = $shell.Namespace($entry.DirectoryName)
+            $item = if ($null -ne $namespace) { $namespace.ParseName($entry.Name) } else { $null }
+            $actualId = if ($null -ne $item) { [string]$item.ExtendedProperty('System.AppUserModel.ID') } else { '' }
+            $snapshot.links += [ordered]@{
+                context = $folder.kind; filename = $entry.Name; readable = $true
+                rootEntry = [string]::Equals($entry.DirectoryName, $folder.path, [StringComparison]::OrdinalIgnoreCase)
+                expectedNameMatch = $entry.Name -eq ($Name + '.lnk'); whiteLabelName = $entry.Name -eq $defaultName
+                targetMatch = $targetMatch; targetCanonicalMatch = $canonicalMatch
+                target = if ($targetMatch) { 'TEST_INSTALL\ai-canvas.exe' } else { $null }
+                workingDirectoryMatch = [string]::Equals([string]$link.WorkingDirectory, $InstallDirectory, [StringComparison]::OrdinalIgnoreCase)
+                iconWithinInstall = $iconWithin; iconExists = $iconWithin -and (Test-Path -LiteralPath $icon -PathType Leaf)
+                iconRelative = if ($iconWithin) { $icon.Substring($InstallDirectory.Length + 1) } else { $null }
+                appUserModelId = $actualId; appUserModelIdMatch = $actualId -eq $AppId
+            }
+        }
+    }
+    return $snapshot
+}
+
+function Assert-InstalledIdentity([object]$Package = $Candidate, [bool]$StrictShortcuts = $true) {
     $binding = Get-Content -LiteralPath (Join-Path $InstallDirectory 'channel-binding-install.json') -Raw -Encoding UTF8 | ConvertFrom-Json
     Assert-True (-not [string]::IsNullOrWhiteSpace([string]$binding.channelName)) 'channel-name-empty'
     Assert-True (-not [string]::IsNullOrWhiteSpace([string]$binding.bindingToken)) 'channel-token-missing'
@@ -417,38 +465,37 @@ function Assert-InstalledIdentity([object]$Package = $Candidate) {
     Assert-True (-not [string]::IsNullOrWhiteSpace($appId)) 'channel-appid-missing'
     if ($null -ne $OriginalAppId) { Assert-True ($appId -eq $OriginalAppId) 'upgrade-appid-changed' }
     $name = (Get-Content -LiteralPath (Join-Path $InstallDirectory 'channel-shortcut-name.txt') -Raw -Encoding Unicode).Trim()
-    $wscript = New-Object -ComObject WScript.Shell
-    $shell = New-Object -ComObject Shell.Application
     $folders = @(
         @{ kind = 'desktop-current'; path = [Environment]::GetFolderPath('DesktopDirectory') },
         @{ kind = 'programs-current'; path = [Environment]::GetFolderPath('Programs') },
         @{ kind = 'desktop-all'; path = [Environment]::GetFolderPath('CommonDesktopDirectory') },
         @{ kind = 'programs-all'; path = [Environment]::GetFolderPath('CommonPrograms') }
     )
-    $links = @()
-    foreach ($folder in $folders) {
-        $path = Join-Path $folder.path ($name + '.lnk')
-        if (-not (Test-Path -LiteralPath $path)) { continue }
-        $link = $wscript.CreateShortcut($path)
-        if (-not [string]::Equals([string]$link.TargetPath, $TargetExecutable, [StringComparison]::OrdinalIgnoreCase)) { continue }
-        $item = $shell.Namespace($folder.path).ParseName([IO.Path]::GetFileName($path))
-        $actualId = [string]$item.ExtendedProperty('System.AppUserModel.ID')
-        $icon = ([string]$link.IconLocation -replace ',\s*-?\d+$', '').Trim('"')
-        Assert-True (Test-Path -LiteralPath $icon -PathType Leaf) 'shortcut-icon-missing'
-        Assert-True ($icon.StartsWith($InstallDirectory + '\', [StringComparison]::OrdinalIgnoreCase)) 'shortcut-icon-outside-install'
-        Assert-True ($actualId -eq $appId) 'shortcut-appid-mismatch'
-        Assert-True ([string]::Equals([string]$link.WorkingDirectory, $InstallDirectory, [StringComparison]::OrdinalIgnoreCase)) 'shortcut-working-directory-mismatch'
-        $links += [ordered]@{ context = $folder.kind; filename = [IO.Path]::GetFileName($path); target = 'TEST_INSTALL\ai-canvas.exe'; workingDirectory = 'TEST_INSTALL'; iconRelative = $icon.Substring($InstallDirectory.Length + 1); appUserModelId = $actualId }
+    $shortcutEvidence = Get-InstalledShortcutSnapshot $folders $name $appId $Package
+    $links = @($shortcutEvidence.links | Where-Object { $_.readable -and $_.rootEntry -and $_.expectedNameMatch -and $_.targetMatch })
+    $gaps = @()
+    foreach ($link in $links) {
+        if (-not $link.iconWithinInstall) { $gaps += 'shortcut-icon-outside-install' }
+        if (-not $link.iconExists) { $gaps += 'shortcut-icon-missing' }
+        if (-not $link.appUserModelIdMatch) { $gaps += 'shortcut-appid-mismatch' }
+        if (-not $link.workingDirectoryMatch) { $gaps += 'shortcut-working-directory-mismatch' }
     }
-    Assert-True (@($links | Where-Object { $_.context -like 'desktop-*' }).Count -gt 0) 'actual-desktop-shortcut-missing'
-    Assert-True (@($links | Where-Object { $_.context -like 'programs-*' }).Count -gt 0) 'actual-start-menu-shortcut-missing'
+    if (@($links | Where-Object { $_.context -like 'desktop-*' }).Count -eq 0) { $gaps += 'actual-desktop-shortcut-missing' }
+    if (@($links | Where-Object { $_.context -like 'programs-*' }).Count -eq 0) { $gaps += 'actual-start-menu-shortcut-missing' }
     $defaultName = [regex]::Unescape('AI \u521b\u4f5c\u5de5\u4f5c\u53f0.lnk')
     if ($name + '.lnk' -ne $defaultName) {
-        foreach ($folder in $folders) { Assert-True (-not (Test-Path -LiteralPath (Join-Path $folder.path $defaultName))) 'stale-white-label-shortcut' }
+        foreach ($folder in $folders) {
+            if (Test-Path -LiteralPath (Join-Path $folder.path $defaultName)) { $gaps += 'stale-white-label-shortcut' }
+        }
     }
+    $shortcutEvidence.acceptanceRole = if ($StrictShortcuts) { 'candidate-acceptance' } else { 'historical-baseline-observation' }
+    $shortcutEvidence.brandingGaps = @($gaps | Select-Object -Unique)
+    $shortcutEvidence.strictBrandingSatisfied = $gaps.Count -eq 0
+    $script:LastShortcutEvidence = $shortcutEvidence
+    if ($StrictShortcuts -and $gaps.Count -gt 0) { throw ('ASSERT:' + $gaps[0]) }
     Assert-True ((Get-Content -LiteralPath (Join-Path $AssetDirectory 'sentinel.txt') -Raw -Encoding UTF8) -eq 'external-asset-must-survive') 'external-assets-changed'
     $slug = if ($null -ne $binding.PSObject.Properties['channelSlug']) { [string]$binding.channelSlug } elseif ($null -ne $binding.PSObject.Properties['slug']) { [string]$binding.slug } else { '' }
-    return [ordered]@{ version = $version; productVersion = [string]$versionInfo.ProductVersion; nativeProductVersion = $nativeVersion; channelName = [string]$binding.channelName; channelSlug = $slug; mode = $mode; bindingPresent = $true; appUserModelId = $appId; shortcuts = $links; hashes = $hashes }
+    return [ordered]@{ version = $version; productVersion = [string]$versionInfo.ProductVersion; nativeProductVersion = $nativeVersion; channelName = [string]$binding.channelName; channelSlug = $slug; mode = $mode; bindingPresent = $true; appUserModelId = $appId; shortcuts = $links; shortcutEvidence = $shortcutEvidence; hashes = $hashes }
 }
 
 function Assert-CandidateFiles {
@@ -457,6 +504,24 @@ function Assert-CandidateFiles {
     Assert-True ($hashes.asar -eq $ExpectedInstalled.asar) 'candidate-asar-not-restored'
     Assert-True ($hashes.helper -eq $ExpectedInstalled.helper) 'candidate-helper-changed'
     return $hashes
+}
+
+function Get-CurrentUserInstallRegistration {
+    foreach ($view in @([Microsoft.Win32.RegistryView]::Registry32, [Microsoft.Win32.RegistryView]::Registry64)) {
+        $base = $null; $install = $null; $uninstall = $null
+        try {
+            $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::CurrentUser, $view)
+            $install = $base.OpenSubKey(('Software\' + $manifest.appGuid), $false)
+            $uninstall = $base.OpenSubKey(('Software\Microsoft\Windows\CurrentVersion\Uninstall\' + $manifest.appGuid), $false)
+            $location = if ($null -ne $install) { [string]$install.GetValue('InstallLocation', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) } else { '' }
+            [ordered]@{ view = $view.ToString(); installKeyPresent = $null -ne $install; installLocationMatchesTestDir = [string]::Equals($location.TrimEnd([char[]]'\/'), $InstallDirectory, [StringComparison]::OrdinalIgnoreCase); uninstallKeyPresent = $null -ne $uninstall }
+        }
+        finally {
+            if ($null -ne $uninstall) { $uninstall.Dispose() }
+            if ($null -ne $install) { $install.Dispose() }
+            if ($null -ne $base) { $base.Dispose() }
+        }
+    }
 }
 
 function Invoke-FixtureCase([string]$Mode, [string]$Scenario) {
@@ -541,6 +606,7 @@ try {
     Assert-True ([Environment]::Is64BitProcess) 'requires-native-64-bit-powershell-host'
     $manifest = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
     Assert-True ([string]$manifest.channelCode -eq 'XINBAO-AI') 'only-authorized-channel-supported'
+    Assert-True ($null -ne $manifest.PSObject.Properties['appGuid'] -and [string]$manifest.appGuid -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') 'manifest-invalid-app-guid'
     $Candidate = Get-Payload $manifest.candidate
     $Baseline = Get-Payload $manifest.baseline
     $Report.candidate = [ordered]@{ sha256 = $Candidate.sha256; version = $Candidate.version }
@@ -583,6 +649,7 @@ public static class NativeInstallerProbe {
     [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", CharSet=CharSet.Unicode)] private static extern IntPtr ReadTextTimeout(IntPtr h, uint msg, IntPtr w, StringBuilder text, uint flags, uint timeout, out IntPtr result);
     [DllImport("kernel32.dll")] private static extern IntPtr OpenProcess(uint rights, bool inherit, int pid);
     [DllImport("kernel32.dll")] private static extern bool CloseHandle(IntPtr h);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode)] private static extern uint GetLongPathName(string path, StringBuilder output, uint length);
     [DllImport("ntdll.dll")] private static extern int NtSuspendProcess(IntPtr h);
     [DllImport("ntdll.dll")] private static extern int NtResumeProcess(IntPtr h);
     private static ProbeWindow Describe(IntPtr h, bool topLevel) {
@@ -608,6 +675,7 @@ public static class NativeInstallerProbe {
     public static bool Command(IntPtr h) { IntPtr parent=GetParent(h); return parent!=IntPtr.Zero && PostMessage(parent,0x111,new IntPtr(GetDlgCtrlID(h) & 0xffff),h); }
     public static bool SetText(IntPtr h, string text) { IntPtr result; return SendTextTimeout(h,0xC,IntPtr.Zero,text,2,1000,out result)!=IntPtr.Zero && result!=IntPtr.Zero; }
     public static bool TextEquals(IntPtr h, string expected) { IntPtr result; StringBuilder text=new StringBuilder(64); return ReadTextTimeout(h,0xD,new IntPtr(text.Capacity),text,2,1000,out result)!=IntPtr.Zero && text.ToString()==expected; }
+    public static string LongPath(string path) { StringBuilder output=new StringBuilder(32768); uint length=GetLongPathName(path,output,(uint)output.Capacity); return length>0 && length<output.Capacity ? output.ToString() : path; }
     public static bool Checked(IntPtr h) { IntPtr result; SendMessageTimeout(h, 0xF0, IntPtr.Zero, IntPtr.Zero, 2, 1000, out result); return result.ToInt64()==1; }
     public static int Suspend(int pid) { IntPtr h=OpenProcess(0x800,false,pid); if(h==IntPtr.Zero)return -1; try{return NtSuspendProcess(h);}finally{CloseHandle(h);} }
     public static int Resume(int pid) { IntPtr h=OpenProcess(0x800,false,pid); if(h==IntPtr.Zero)return -1; try{return NtResumeProcess(h);}finally{CloseHandle(h);} }
@@ -683,7 +751,7 @@ public static class ValidationFixture {
     Assert-True $ok 'native-ui-prerequisite-failed'
     $ok = Invoke-Case 'protected-baseline-fresh-interactive-real-channel' {
         $flow = Invoke-Installer $Baseline 'standalone' 'no-target'
-        $identity = Assert-InstalledIdentity $Baseline
+        $identity = Assert-InstalledIdentity $Baseline $false
         $script:OriginalAppId = $identity.appUserModelId
         return @{ flow = $flow; installed = $identity }
     }
@@ -773,10 +841,14 @@ public static class ValidationFixture {
     } | Out-Null
     Invoke-Case 'actual-asar-exclusive-lock-safe-failure-or-atomic-replacement' {
         Stop-TargetProcesses
+        $result = @{ outcome = 'preparing'; registrationBefore = @(Get-CurrentUserInstallRegistration) }
+        $script:LastLockCaseEvidence = $result
+        $result.identityBefore = Assert-InstalledIdentity
+        $registrationBeforeValid = @($result.registrationBefore | Where-Object { $_.installKeyPresent -and $_.installLocationMatchesTestDir -and $_.uninstallKeyPresent }).Count -gt 0
+        Assert-True $registrationBeforeValid 'lock-registration-prerequisite-missing'
         $asar = Join-Path $InstallDirectory 'resources\app.asar'
         $before = @{ exe = Get-Hash $TargetExecutable; asar = Get-Hash $asar }
         $lock = [IO.File]::Open($asar, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
-        $result = $null
         try {
             Assert-True ((Get-OpenStreamHash $lock) -eq $before.asar) 'locked-asar-baseline-hash-mismatch'
             $flow = Invoke-Installer $Candidate 'updated' 'replacement-lock'
@@ -784,13 +856,18 @@ public static class ValidationFixture {
             if ($flow.exitCode -eq 0) {
                 # A new readable ASAR while the old handle denies sharing proves a separate file object.
                 $hashes = Assert-CandidateFiles
-                $result = @{ outcome = 'completed-atomic-replacement'; flow = $flow; oldOpenHandlePreserved = $true; newAsarReadableWhileOldHandleExclusive = $true; installedHashes = $hashes }
+                $result.outcome = 'completed-atomic-replacement'
+                $result.newAsarReadableWhileOldHandleExclusive = $true
+                $result.installedHashes = $hashes
             }
             else {
-                $result = @{ outcome = 'explicitly-cancelled-locked-replacement'; flow = $flow; oldOpenHandlePreserved = $true }
+                $result.outcome = 'explicitly-cancelled-locked-replacement'
             }
+            $result.flow = $flow
+            $result.oldOpenHandlePreserved = $true
         }
         finally { $lock.Dispose() }
+        $result.registrationAfter = @(Get-CurrentUserInstallRegistration)
         if ($result.outcome -eq 'explicitly-cancelled-locked-replacement') {
             Assert-True ((Get-Hash $TargetExecutable) -eq $before.exe -and (Get-Hash $asar) -eq $before.asar) 'lock-failure-replaced-old-binaries'
             $result.unchangedExeAndAsar = $true
@@ -798,6 +875,22 @@ public static class ValidationFixture {
             $result.processHelperPreserved = Test-Path -LiteralPath (Join-Path $InstallDirectory 'installer-manage-process.ps1')
             if (-not $result.channelMetadataPreserved -or -not $result.processHelperPreserved) {
                 $result.acceptanceFailureCode = 'locked-replacement-removed-installed-metadata'
+            }
+            $registrationAfterValid = @($result.registrationAfter | Where-Object { $_.installKeyPresent -and $_.installLocationMatchesTestDir -and $_.uninstallKeyPresent }).Count -gt 0
+            $result.registrationPreserved = $registrationBeforeValid -and $registrationAfterValid -and (($result.registrationBefore | ConvertTo-Json -Compress) -ceq ($result.registrationAfter | ConvertTo-Json -Compress))
+            if (-not $result.registrationPreserved -and -not $result.ContainsKey('acceptanceFailureCode')) {
+                $result.acceptanceFailureCode = 'locked-replacement-registration-not-preserved'
+            }
+            try {
+                $result.identityAfterBeforeRepair = Assert-InstalledIdentity
+                $result.identityPreservedBeforeRepair = $true
+            }
+            catch {
+                $result.identityPreservedBeforeRepair = $false
+                $result.identityFailureCode = if ($_.Exception.Message -match '^ASSERT:([a-z0-9-]+)$') { $Matches[1] } else { 'unexpected-' + $_.Exception.GetType().Name }
+                $result.identityFailureLine = $_.InvocationInfo.ScriptLineNumber
+                if (Get-Variable LastShortcutEvidence -Scope Script -ErrorAction SilentlyContinue) { $result.shortcutsAfterBeforeRepair = $script:LastShortcutEvidence }
+                if (-not $result.ContainsKey('acceptanceFailureCode')) { $result.acceptanceFailureCode = 'locked-replacement-identity-not-preserved' }
             }
             # Some historical uninstallers remove metadata before atomic cleanup; recover only this test install.
             $OtherProcess.Refresh()
@@ -830,6 +923,8 @@ finally {
     if (Get-Variable LastUiEvidence -Scope Script -ErrorAction SilentlyContinue) { $Report.lastUi = $script:LastUiEvidence }
     if (Get-Variable LastInstallerTrace -Scope Script -ErrorAction SilentlyContinue) { $Report.lastInstallerTrace = $script:LastInstallerTrace }
     if (Get-Variable LastInstalledVersionEvidence -Scope Script -ErrorAction SilentlyContinue) { $Report.lastInstalledVersion = $script:LastInstalledVersionEvidence }
+    if (Get-Variable LastShortcutEvidence -Scope Script -ErrorAction SilentlyContinue) { $Report.lastShortcutEvidence = $script:LastShortcutEvidence }
+    if (Get-Variable LastLockCaseEvidence -Scope Script -ErrorAction SilentlyContinue) { $Report.lockEvidence = $script:LastLockCaseEvidence }
     [IO.Directory]::CreateDirectory($OutputDirectory) | Out-Null
     Write-Json (Join-Path $OutputDirectory 'report.json') $Report
     $lines = @('Status: ' + $Report.status)
